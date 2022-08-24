@@ -286,7 +286,7 @@ def test(model, predictor, x, subgraph_loader, split_edge, evaluator,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='OGBL-Citation2 (NS)')
+    parser = argparse.ArgumentParser(description='OGBL-Vessel (NS)')
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--log_steps', type=int, default=1)
     parser.add_argument('--num_workers', type=int, default=6)
