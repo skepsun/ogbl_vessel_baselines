@@ -71,7 +71,7 @@ GCN/GraphSAGE and MLP can gain significant improvements with this predictor. Mor
 ## Results
 By running script like:
 
-```python main.py --model mlp --epochs 1000 --eval_steps 20 --num_layers 3 --hidden_channels 64 --dropout 0. -- predictor {choose_your_predictor} --node_feat_process {choose_your_preprocessing_method} --lr 0.001```
+```python main.py --model mlp --epochs 1000 --eval_steps 20 --num_layers 3 --hidden_channels 64 --dropout 0. --predictor {choose_your_predictor} --node_feat_process {choose_your_preprocessing_method} --lr 0.001```
 
 we obtain results of MLP (3 layers of 256 hidden dim, 10 runs including the first row):
 
@@ -92,7 +92,7 @@ we obtain results of MLP (3 layers of 256 hidden dim, 10 runs including the firs
 
 By running script like:
 
-```python main.py --model sage --epochs 100 --eval_steps 10 --num_layers 1 --hidden_channels 64 --dropout 0. -- predictor {choose_your_predictor} --node_feat_process {choose_your_preprocessing_method} --lr 0.001```
+```python main.py --model sage --epochs 100 --eval_steps 10 --num_layers 1 --hidden_channels 64 --dropout 0. --predictor {choose_your_predictor} --node_feat_process {choose_your_preprocessing_method} --lr 0.001```
 
 we obtain preliminary results of GraphSAGE (1 layer of 64 hidden dim with adding self-loops, 5 runs due to limited time):
 |Preprocessing | Model | Predictor | Train ROC-AUC | Val ROC-AUC | Test ROC-AUC |
