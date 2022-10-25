@@ -6,8 +6,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from torch_geometric.loader import NeighborSampler
-from torch_geometric.nn import SAGEConv
-from torch_geometric.utils import to_undirected
+from torch_geometric.nn import SAGEConv, GATConv
+from torch_geometric.utils import to_undirected, add_self_loops
 
 from ogb.linkproppred import PygLinkPropPredDataset, Evaluator
 
@@ -147,12 +147,65 @@ class SAGE(torch.nn.Module):
 
         return x_all
 
+class GAT(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers, heads,
+                 dropout):
+        super(GAT, self).__init__()
+
+        self.dropout = dropout
+        self.num_layers = num_layers
+
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(GATConv(in_channels, hidden_channels, heads, concat=True))
+        for _ in range(num_layers - 2):
+            self.convs.append(GATConv(hidden_channels * heads, hidden_channels, heads, concat=True))
+        self.convs.append(GATConv(hidden_channels, out_channels, heads, concat=False))
+
+    def forward(self, x, adjs):
+        for i, (edge_index, _, size) in enumerate(adjs):
+            x_target = x[:size[1]]  # Target nodes are always placed first.
+            x = self.convs[i]((x, x_target), edge_index)
+            if i != self.num_layers - 1:
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+        return x
+
+    def reset_parameters(self):
+        for conv in self.convs:
+            conv.reset_parameters()
+
+    def inference(self, x_all, subgraph_loader, device):
+        pbar = tqdm(total=x_all.size(0) * self.num_layers)
+        pbar.set_description('Evaluating')
+
+        # Compute representations of nodes layer by layer, using *all*
+        # available edges. This leads to faster computation in contrast to
+        # immediately computing the final representations of each batch.
+        for i in range(self.num_layers):
+            xs = []
+            for batch_size, n_id, adj in subgraph_loader:
+                edge_index, _, size = adj.to(device)
+                x = x_all[n_id].to(device)
+                x_target = x[:size[1]]
+                x = self.convs[i]((x, x_target), edge_index)
+                if i != self.num_layers - 1:
+                    x = F.relu(x)
+                xs.append(x.cpu())
+
+                pbar.update(batch_size)
+
+            x_all = torch.cat(xs, dim=0)
+
+        pbar.close()
+
+        return x_all
+
 
 class LinkPredictor(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
-                 dropout):
+                 dropout, method='DOT'):
         super(LinkPredictor, self).__init__()
-
+        self.method = method
         self.lins = torch.nn.ModuleList()
         self.lins.append(torch.nn.Linear(in_channels, hidden_channels))
         for _ in range(num_layers - 2):
@@ -166,7 +219,23 @@ class LinkPredictor(torch.nn.Module):
             lin.reset_parameters()
 
     def forward(self, x_i, x_j):
-        x = x_i * x_j
+        if self.method == 'DOT':
+            # For end-to-end SEAL model, the final score for the subgraph induced by two nodes
+            # is calculated based on pooling.
+            x = x_i * x_j
+        elif self.method == 'COS':
+            x = torch.sum(x_i * x_j, dim=-1) / \
+                torch.sqrt(torch.sum(x_i * x_i, dim=-1) * torch.sum(x_j * x_j, dim=-1)).clamp(min=1-9)
+            return torch.sigmoid(x)
+        elif self.method == 'SUM':
+            x = x_i + x_j
+        elif self.method == 'DIFF':
+            # The difference between two nodes' coordinate features seems more appropriate.
+            # The risk is when x_i and x_j are swapped, the output is opposite.
+            x = (x_i - x_j).abs()
+
+        # x = F.dropout(x, p=self.dropout, training=self.training)
+        # x = F.relu(x)
         for lin in self.lins[:-1]:
             x = lin(x)
             x = F.relu(x)
@@ -287,16 +356,23 @@ def test(model, predictor, x, subgraph_loader, split_edge, evaluator,
 
 def main():
     parser = argparse.ArgumentParser(description='OGBL-Vessel (NS)')
+    parser.add_argument('--root', type=str, default='/mnt/ssd/ssd/dataset')
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--log_steps', type=int, default=1)
     parser.add_argument('--num_workers', type=int, default=6)
+    parser.add_argument('--node_feat_process', type=str, default='node_normalize')
+    parser.add_argument('--add_self_loops', action='store_true')
+    parser.add_argument('--model', type=str, default='gcn')
+    parser.add_argument('--predictor', type=str, default='DOT')
     parser.add_argument('--num_layers', type=int, default=2)
-    parser.add_argument('--hidden_channels', type=int, default=16)
-    parser.add_argument('--dropout', type=float, default=0.)
+    parser.add_argument('--num_heads', type=int, default=1)
+    parser.add_argument('--hidden_channels', type=int, default=64)
+    parser.add_argument('--dropout', type=float, default=0.5)
     parser.add_argument('--batch_size', type=int, default=1024 * 64)
-    parser.add_argument('--lr', type=float, default=0.00001)
+    parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--eval_steps', type=int, default=1)
+    parser.add_argument('--use_node_embedding', action='store_true')
     parser.add_argument('--runs', type=int, default=10)
     args = parser.parse_args()
     print(args)
@@ -304,19 +380,34 @@ def main():
     device = f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
 
-    dataset = PygLinkPropPredDataset(name='ogbl-vessel')
+    dataset = PygLinkPropPredDataset(name='ogbl-vessel', root=args.root)
     split_edge = dataset.get_edge_split()
     data = dataset[0]
-    # normalize x,y,z coordinates  
-    data.x[:, 0] = torch.nn.functional.normalize(data.x[:, 0], dim=0)
-    data.x[:, 1] = torch.nn.functional.normalize(data.x[:, 1], dim=0)
-    data.x[:, 2] = torch.nn.functional.normalize(data.x[:, 2], dim=0)
+    if args.node_feat_process == 'node_normalize':
+        # normalize x,y,z coordinates 
+        data.x = torch.nn.functional.normalize(data.x, dim=0)
+    elif args.node_feat_process == 'channel_normalize':
+        data.x = torch.nn.functional.normalize(data.x, dim=1)
+    elif args.node_feat_process == 'max-min':
+        data.x = (data.x - data.x.min(dim=0)[0]) / (data.x.max(0)[0] - data.x.min(0)[0] + 1e-9)
+    elif args.node_feat_process == 'z-score':
+        data.x = (data.x - data.x.mean(0)) / (data.x.std(0) + 1e-9)
+    elif args.node_feat_process == 'log':
+        data.x = data.x.abs().clamp(min=1e-9).log() * data.x / data.x.abs().clamp(min=1e-9)
+    elif args.node_feat_process == 'none':
+        pass
+    else:
+        raise(Exception(f'The preprocessing method of node features: {args.node_feat_process} has not been implemented'))
+
 
     data.x = data.x.to(torch.float)
     if args.use_node_embedding:
         # data.x = torch.cat([data.x, torch.load('embedding.pt')], dim=-1)
-        data.x = torch.load('embedding.pt')
+        data.x = torch.load('../embedding.pt')
     x = data.x.to(device)
+
+    if args.add_self_loops:
+        data.edge_index, _ = add_self_loops(data.edge_index, num_nodes=data.num_nodes)
 
     pos_loader = PositiveLinkNeighborSampler(data.edge_index, sizes=[10, 5],
                                              num_nodes=x.size(0),
@@ -334,11 +425,18 @@ def main():
                                       batch_size=64*1024, shuffle=False,
                                       num_workers=args.num_workers)
 
+    if args.model == 'gcn':
+        model = GCN(x.size(-1), args.hidden_channels, args.hidden_channels,
+                    args.num_layers, args.dropout).to(device)
+    elif args.model == 'sage':
+        model = SAGE(x.size(-1), args.hidden_channels, args.hidden_channels,
+                    args.num_layers, args.dropout).to(device)
+    elif args.model == 'gat':
+        model = GAT(x.size(-1), args.hidden_channels, args.hidden_channels,
+                    args.num_layers, args.num_heads, args.dropout).to(device)
 
-    model = GCN(x.size(-1), args.hidden_channels, args.hidden_channels,
-                 args.num_layers, args.dropout).to(device)
     predictor = LinkPredictor(args.hidden_channels, args.hidden_channels, 1,
-                              args.num_layers, args.dropout).to(device)
+                              args.num_layers, args.dropout, method=args.predictor).to(device)
 
     evaluator = Evaluator(name='ogbl-vessel')
     logger = Logger(args.runs, args)

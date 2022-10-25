@@ -7,7 +7,7 @@ from ogb.linkproppred import PygLinkPropPredDataset
 
 
 def save_embedding(model):
-    torch.save(model.embedding.weight.data.cpu(), 'embedding.pt')
+    torch.save(model.embedding.weight.data.cpu(), '../embedding.pt')
 
 
 def main():
